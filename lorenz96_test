@@ -69,19 +69,36 @@ def run_transient_phase(x0, t_transient, F):
     return trajectory_transient[-1]  # Final state after transient
 
 # ------------------------------
-# Step 4: Energy Function (Loss Metric)
+# Step 5: Loss Function for Optimization
 # ------------------------------
-def energy(x):
+def loss_fn(x0, t, F, target_energy, x0_init):
     """
-    Computes the energy of the Lorenz-96 system.
-    
+    Loss function for gradient descent. The goal is for the Lorenz-96 system's energy
+    at the final time to match the target energy.
+
     Args:
-        x: Current state of the system (array of length N).
-    
+        x0: Initial conditions (array of length N).
+        t: Time array for simulation.
+        F: Forcing parameter.
+        target_energy: Desired target energy.
+
     Returns:
-        Energy as the sum-square of the state variables.
+        Scalar loss value.
     """
-    return 0.5 * jnp.sum(x ** 2, axis=-1)
+    # Compute trajectory for the given initial condition
+    trajectory = solve_lorenz96(x0, t, F)
+    # Compute system's energy at final time
+    energy_at_final_time = energy(trajectory[-1])
+    # Integrated energy
+    energy_integral = jnp.sum(energy(trajectory))/len(trajectory)
+
+    #print(energy_at_final_time)
+    # Define loss as squared difference between energy and target energy
+    loss_part_one = (energy_integral - target_energy) ** 2
+    loss_part_one = (energy(trajectory)[-1] - target_energy) ** 2
+    loss_part_two =  jnp.sum(x0-x0_init)**2
+    lam = 0
+    return loss_part_one  + lam * loss_part_two
 
 
 # ------------------------------
@@ -138,14 +155,24 @@ def optimize_with_optax(initial_x0, t, F, target_energy, learning_rate=1e-3, max
     x0 = initial_x0
     optimizer = optax.adam(learning_rate)
     opt_state = optimizer.init(x0)
-
+    update_index = 0  # Index to update
+    
     # Loss function
     losses = []
+
+    def masked_grads(grads):
+        """
+        Mask the gradients to update only the specified index.
+        """
+        mask = jnp.zeros_like(grads)  # Create a mask of zeros
+        mask = mask.at[update_index].set(1.0)  # Set the specified index to 1
+        return grads * mask  # Apply the mask
 
     # Optimization loop
     for i in range(max_iters):
         # Compute loss and gradients
         loss, grads = jax.value_and_grad(loss_fn)(x0, t, F, target_energy, initial_x0)
+        grads =  masked_grads(grads)
         losses.append(loss)
 
         # Apply parameter update
@@ -157,12 +184,17 @@ def optimize_with_optax(initial_x0, t, F, target_energy, learning_rate=1e-3, max
             print(f"Iteration {i}, Loss: {loss}")
 
         # Convergence check
-        if loss < 1e-6:
+        # to avoid bounce back from going below 2
+        if i > 10:
+          if jnp.abs(loss-losses[-2]) < 1e-4:
             print("Converged!")
             break
 
     return x0, losses
 
+# ------------------------------
+# Step 7: Main Workflow
+# ------------------------------
 
 # ------------------------------
 # Step 7: Main Workflow
@@ -170,18 +202,18 @@ def optimize_with_optax(initial_x0, t, F, target_energy, learning_rate=1e-3, max
 if __name__ == "__main__":
     # Lorenz-96 parameters
     F = 8.0          # Forcing parameter
-    N = 4        # Number of variables in the Lorenz-96 system
+    N = 32        # Number of variables in the Lorenz-96 system
     T_transient = 20 # Time to run the transient phase
     T_final = 5     # Time for the main simulation
     num_transient_points = 1000
-    num_simulation_points = 10
+    num_simulation_points = 1000
 
     # Time arrays
     t_transient = jnp.linspace(0, T_transient, num_transient_points)
     t_simulation = jnp.linspace(0, T_final, num_simulation_points)
 
     # Initial conditions for the Lorenz-96 system
-    key = jax.random.PRNGKey(42) 
+    key = jax.random.PRNGKey(42)
     x0 = jax.random.normal(key, shape=(N,)) #np.ones(N)  # Arbitrary initial guess (e.g., all variables start at 1)
 
     # Step 1: Remove transient behavior
@@ -192,14 +224,14 @@ if __name__ == "__main__":
 
     # Step 2: Perform optimization on the transient-free initial condition
     print("\nStarting gradient descent optimization...")
-    target_energy = 70 #energy(x0_transient_free) + 1  # Example energy target
-    learning_rate = 1
+    target_energy = 360 #energy(x0_transient_free) + 1  # Example energy target
     max_iterations = 50
 
     optimized_x0, losses = optimize_with_optax(
         initial_x0=x0_transient_free,
         t=t_simulation,
         F=F,
+        learning_rate=1e-1, 
         target_energy=target_energy,
         max_iters=max_iterations
     )
@@ -217,27 +249,27 @@ if __name__ == "__main__":
     plt.legend()
     plt.show()
 
-  # Step 4: Plot initial and final trajectory
-  traj_init = solve_lorenz96(x0, t_transient, F)
-  plt.figure(figsize=(10, 6))
-  plt.plot(t_transient, energy(traj_init), label="Original trajectory")
-  plt.xlabel("Time")
-  plt.ylabel("Energy")
-  plt.grid()
-  plt.legend()
-  plt.show()
-  
-  # Step 5: Plot initial and final trajectory
-  traj_init = solve_lorenz96(x0_transient_free, t_simulation, F)
-  traj_optimized = solve_lorenz96(optimized_x0, t_simulation, F)
-  plt.figure(figsize=(10, 6))
-  plt.plot(t_simulation, energy(traj_init), label="Original trajectory")
-  plt.plot(t_simulation, energy(traj_optimized), label="Optimized trajectory", linestyle='--')
-  #plt.yscale('log')
-  plt.xlabel("Time")
-  plt.ylabel("Energy")
-  plt.grid()
-  plt.legend()
-  plt.show()
-
-  print(x0_transient_free, optimized_x0)
+    # Step 4: Plot initial and final trajectory
+    traj_init = solve_lorenz96(x0, t_transient, F)
+    plt.figure(figsize=(10, 6))
+    plt.plot(t_transient, energy(traj_init), label="Original trajectory")
+    plt.xlabel("Time")
+    plt.ylabel("Energy")
+    plt.grid()
+    plt.legend()
+    plt.show()
+    
+    # Step 5: Plot initial and final trajectory
+    traj_init = solve_lorenz96(x0_transient_free, t_simulation, F)
+    traj_optimized = solve_lorenz96(optimized_x0, t_simulation, F)
+    plt.figure(figsize=(10, 6))
+    plt.plot(t_simulation, energy(traj_init), label="Original trajectory")
+    plt.plot(t_simulation, energy(traj_optimized), label="Optimized trajectory", linestyle='--')
+    #plt.yscale('log')
+    plt.xlabel("Time")
+    plt.ylabel("Energy")
+    plt.grid()
+    plt.legend()
+    plt.show()
+    
+    print(x0_transient_free, optimized_x0)
