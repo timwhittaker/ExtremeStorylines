@@ -1,0 +1,243 @@
+import jax
+import jax.numpy as jnp
+from jax.experimental.ode import odeint
+import matplotlib.pyplot as plt
+import optax 
+
+# ------------------------------
+# Step 1: Lorenz-96 System Definition
+# ------------------------------
+def lorenz96(x, t, F):
+    """
+    Lorenz-96 model with constant forcing.
+
+    Args:
+        x: Current system state (array of length N).
+        t: Time (not used directly, as Lorenz-96 is autonomous).
+        F: Forcing parameter.
+
+    Returns:
+        Derivative dx/dt for the Lorenz-96 system.
+    """
+    # Number of variables
+    N = x.shape[0]
+
+    # Compute cyclic boundary conditions
+    dxdt = (x[(jnp.arange(N) + 1) % N] - x[jnp.arange(N) - 2]) * x[jnp.arange(N) - 1] - x + F
+    return dxdt
+
+# ------------------------------
+# Step 2: Solve Lorenz-96 ODE
+# (Using JAX's odeint)
+# ------------------------------
+def solve_lorenz96(x0, t, F):
+    """
+    Solves the Lorenz-96 system numerically using JAX odeint.
+
+    Args:
+        x0: Initial condition (array of length N).
+        t: Array of time points for the solution.
+        F: Forcing parameter.
+
+    Returns:
+        Trajectory (states of the system at each time point in t).
+    """
+    # ODE function wrapper compatible with odeint (time comes first)
+    def dxdt(x, t):
+        return lorenz96(x, t, F)
+    
+    # Solve using odeint
+    trajectory = odeint(dxdt, x0, t)
+    return trajectory
+
+# ------------------------------
+# Step 3: Remove Transients
+# ------------------------------
+def run_transient_phase(x0, t_transient, F):
+    """
+    Removes the transient behavior by running the Lorenz-96 system for a long time.
+
+    Args:
+        x0: Initial conditions (array of length N).
+        t_transient: Time array for the transient phase.
+        F: Forcing parameter.
+
+    Returns:
+        State of the system after the transient phase (transient-free x0).
+    """
+    trajectory_transient = solve_lorenz96(x0, t_transient, F)
+    return trajectory_transient[-1]  # Final state after transient
+
+# ------------------------------
+# Step 4: Energy Function (Loss Metric)
+# ------------------------------
+def energy(x):
+    """
+    Computes the energy of the Lorenz-96 system.
+    
+    Args:
+        x: Current state of the system (array of length N).
+    
+    Returns:
+        Energy as the sum-square of the state variables.
+    """
+    return 0.5 * jnp.sum(x ** 2, axis=-1)
+
+
+# ------------------------------
+# Step 5: Loss Function for Optimization
+# ------------------------------
+def loss_fn(x0, t, F, target_energy, x0_init):
+    """
+    Loss function for gradient descent. The goal is for the Lorenz-96 system's energy
+    at the final time to match the target energy.
+
+    Args:
+        x0: Initial conditions (array of length N).
+        t: Time array for simulation.
+        F: Forcing parameter.
+        target_energy: Desired target energy.
+
+    Returns:
+        Scalar loss value.
+    """
+    # Compute trajectory for the given initial condition
+    trajectory = solve_lorenz96(x0, t, F)
+    # Compute system's energy at final time
+    energy_at_final_time = energy(trajectory[-1])
+    # Integrated energy
+    energy_integral = jnp.sum(energy(trajectory))/len(trajectory)
+    
+    #print(energy_at_final_time)
+    # Define loss as squared difference between energy and target energy
+    loss_part_one = (energy_integral - target_energy) ** 2
+    loss_part_two =  jnp.sum(x0-x0_init)**2
+    lam = 500
+    return loss_part_one  + lam * loss_part_two
+
+# ------------------------------
+# Step 6: Gradient Descent Algorithm
+# ------------------------------
+def optimize_with_optax(initial_x0, t, F, target_energy, learning_rate=1e-3, max_iters=200):
+    """
+    Optimize initial conditions of the Lorenz-96 system using Optax's Adam optimizer.
+
+    Args:
+        initial_x0: Initial conditions to start optimization.
+        t: Time array for simulation.
+        F: Forcing parameter.
+        target_energy: Desired target energy.
+        learning_rate: Learning rate for Adam optimizer.
+        max_iters: Maximum optimization iterations.
+
+    Returns:
+        optimized_x0: Optimized initial conditions.
+        losses: List of loss values during optimization.
+    """
+    # Initialize parameters and optimizer
+    x0 = initial_x0
+    optimizer = optax.adam(learning_rate)
+    opt_state = optimizer.init(x0)
+
+    # Loss function
+    losses = []
+
+    # Optimization loop
+    for i in range(max_iters):
+        # Compute loss and gradients
+        loss, grads = jax.value_and_grad(loss_fn)(x0, t, F, target_energy, initial_x0)
+        losses.append(loss)
+
+        # Apply parameter update
+        updates, opt_state = optimizer.update(grads, opt_state, x0)
+        x0 = optax.apply_updates(x0, updates)
+
+        # Print progress
+        if i % 10 == 0 or i == max_iters - 1:
+            print(f"Iteration {i}, Loss: {loss}")
+
+        # Convergence check
+        if loss < 1e-6:
+            print("Converged!")
+            break
+
+    return x0, losses
+
+
+# ------------------------------
+# Step 7: Main Workflow
+# ------------------------------
+if __name__ == "__main__":
+    # Lorenz-96 parameters
+    F = 8.0          # Forcing parameter
+    N = 4        # Number of variables in the Lorenz-96 system
+    T_transient = 20 # Time to run the transient phase
+    T_final = 5     # Time for the main simulation
+    num_transient_points = 1000
+    num_simulation_points = 10
+
+    # Time arrays
+    t_transient = jnp.linspace(0, T_transient, num_transient_points)
+    t_simulation = jnp.linspace(0, T_final, num_simulation_points)
+
+    # Initial conditions for the Lorenz-96 system
+    key = jax.random.PRNGKey(42) 
+    x0 = jax.random.normal(key, shape=(N,)) #np.ones(N)  # Arbitrary initial guess (e.g., all variables start at 1)
+
+    # Step 1: Remove transient behavior
+    print("Running transient phase...")
+    x0_transient_free = run_transient_phase(x0, t_transient, F)
+    print("Transient-free initial condition:", x0_transient_free)
+    print(energy(x0_transient_free))
+
+    # Step 2: Perform optimization on the transient-free initial condition
+    print("\nStarting gradient descent optimization...")
+    target_energy = 70 #energy(x0_transient_free) + 1  # Example energy target
+    learning_rate = 1
+    max_iterations = 50
+
+    optimized_x0, losses = optimize_with_optax(
+        initial_x0=x0_transient_free,
+        t=t_simulation,
+        F=F,
+        target_energy=target_energy,
+        max_iters=max_iterations
+    )
+
+    print("\nOptimized initial condition:", optimized_x0)
+    print("Final loss:", losses[-1])
+
+    # Step 3: Plot Loss Evolution
+    plt.figure(figsize=(10, 6))
+    plt.plot(losses, label="Loss during Optimization")
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss")
+    plt.title("Gradient Descent: Loss Evolution")
+    plt.grid()
+    plt.legend()
+    plt.show()
+
+  # Step 4: Plot initial and final trajectory
+  traj_init = solve_lorenz96(x0, t_transient, F)
+  plt.figure(figsize=(10, 6))
+  plt.plot(t_transient, energy(traj_init), label="Original trajectory")
+  plt.xlabel("Time")
+  plt.ylabel("Energy")
+  plt.grid()
+  plt.legend()
+  plt.show()
+  
+  # Step 5: Plot initial and final trajectory
+  traj_init = solve_lorenz96(x0_transient_free, t_simulation, F)
+  traj_optimized = solve_lorenz96(optimized_x0, t_simulation, F)
+  plt.figure(figsize=(10, 6))
+  plt.plot(t_simulation, energy(traj_init), label="Original trajectory")
+  plt.plot(t_simulation, energy(traj_optimized), label="Optimized trajectory", linestyle='--')
+  #plt.yscale('log')
+  plt.xlabel("Time")
+  plt.ylabel("Energy")
+  plt.grid()
+  plt.legend()
+  plt.show()
+
+  print(x0_transient_free, optimized_x0)
