@@ -126,7 +126,7 @@ def compute_loss(diff_state, non_diff_components):
         length=outer_steps
     )
     
-    # Physics-informed loss calculation
+    # loss calculation
     final_temp = jnp.mean(temp_traj[-4*24,0,-1,closest_lon_index:closest_lon_index+2, closest_lat_index:closest_lat_index+2])
     return jnp.mean(TARGET_TEMP - final_temp) ** 2 
 
