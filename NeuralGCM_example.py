@@ -20,21 +20,27 @@ import neuralgcm
 
 import matplotlib.pyplot as plt
 import os
+import yaml
+
 gcs = gcsfs.GCSFileSystem(token='anon')
 
-sliced_era5 = xarray.open_zarr("hw_init.zarr", chunks=None)
+with open("config.yaml", "r") as file:
+    config = yaml.safe_load(file)
 
 model_name = 'v1/deterministic_2_8_deg.pkl'
 with gcs.open(f'gs://neuralgcm/models/{model_name}', 'rb') as f:
     ckpt = pickle.load(f)
 model = neuralgcm.PressureLevelModel.from_checkpoint(ckpt)
 
+
+sliced_era5 = xarray.open_zarr("hw_init_21.zarr", chunks=None)
 era5_grid = spherical_harmonic.Grid(
     latitude_nodes=sliced_era5.sizes['latitude'],
     longitude_nodes=sliced_era5.sizes['longitude'],
     latitude_spacing=xarray_utils.infer_latitude_spacing(sliced_era5.latitude),
     longitude_offset=xarray_utils.infer_longitude_offset(sliced_era5.longitude),
 )
+
 regridder = horizontal_interpolation.ConservativeRegridder(
     era5_grid, model.data_coords.horizontal, skipna=True
 )
@@ -62,31 +68,31 @@ def extract_non_diff(state):
     inner_state = state.state
     memory = state.memory
     divergence = inner_state.divergence
-    #vorticity = inner_state.vorticity
+    vorticity = inner_state.vorticity
     temperature_variation = inner_state.temperature_variation
     tracers = inner_state.tracers
     sim_time = inner_state.sim_time
-    #new_inner_state = inner_state.replace(temperature_variation=None, divergence=None, vorticity=None, tracers=None, sim_time=None)
-    new_inner_state = inner_state.replace(temperature_variation=None, divergence=None, tracers=None, sim_time=None)
+    new_inner_state = inner_state.replace(temperature_variation=None, divergence=None, vorticity=None, tracers=None, sim_time=None)
+    #new_inner_state = inner_state.replace(temperature_variation=None, divergence=None, tracers=None, sim_time=None)
     # Remove non-differentiable components
     new_state = state.replace(state=new_inner_state, randomness=None, memory=None)
 
-    #return new_state, (randomness, temperature_variation, divergence, vorticity, tracers, sim_time, memory)
-    return new_state, (randomness, temperature_variation, divergence, tracers, sim_time, memory)
+    return new_state, (randomness, temperature_variation, divergence, vorticity, tracers, sim_time, memory)
+    #return new_state, (randomness, temperature_variation, divergence, tracers, sim_time, memory)
 
 
 def reconstruct_full_state(state_without_non_diff, non_diff_components):
     """Reconstruct the full state by adding back non-differentiable components."""
-    #randomness, temp_var, div, vort, tracers, sim_time, memory = non_diff_components
-    randomness, temp_var, div, tracers, sim_time, memory = non_diff_components
+    randomness, temp_var, div, vort, tracers, sim_time, memory = non_diff_components
+    #randomness, temp_var, div, tracers, sim_time, memory = non_diff_components
     temp_var = jax.lax.stop_gradient(temp_var)
     div = jax.lax.stop_gradient(div)
-    #vort = jax.lax.stop_gradient(vort)
+    vort = jax.lax.stop_gradient(vort)
     tracers = jax.lax.stop_gradient(tracers)
     sim_time = jax.lax.stop_gradient(sim_time)
     inner_state = state_without_non_diff.state
-    #new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, vorticity=vort, tracers=tracers, sim_time=sim_time)
-    new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, tracers=tracers, sim_time=sim_time)
+    new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, vorticity=vort, tracers=tracers, sim_time=sim_time)
+    #new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, tracers=tracers, sim_time=sim_time)
     return state_without_non_diff.replace(randomness=randomness, state=new_inner_state, memory=memory)
 
 lytton_lat = 50.231111
@@ -99,13 +105,13 @@ closest_lat_index = np.abs(eval_era5.latitude.values - lytton_lat).argmin() + 1
 closest_lon_index = np.abs(eval_era5.longitude.values - lytton_lon_positive).argmin() + 1
 print(closest_lat_index, closest_lon_index)
 # Configuration
-TARGET_TEMP = 315.0
-outer_steps = 14*24  # Total trajectory steps per iteration
+TARGET_TEMP = 320.0
+outer_steps = 9*24  # Total trajectory steps per iteration
 
 
 
 @partial(jax.jit)
-def compute_loss(diff_state, non_diff_components):
+def compute_loss(diff_state, non_diff_components, initial_diff_state):
     """Checkpoint-friendly loss computation using your state structure"""
     # Reconstruct full state using your method
     full_state = reconstruct_full_state(diff_state, non_diff_components)
@@ -127,47 +133,79 @@ def compute_loss(diff_state, non_diff_components):
     )
     
     # loss calculation
-    final_temp = jnp.mean(temp_traj[-4*24,0,-1,closest_lon_index:closest_lon_index+2, closest_lat_index:closest_lat_index+2])
-    return jnp.mean(TARGET_TEMP - final_temp) ** 2 
+    alpha = 1000
+    lam = 10
+    reg_term = jnp.sum((diff_state.state.log_surface_pressure - initial_diff_state.state.log_surface_pressure) ** 2)
+    final_temp = jnp.mean(temp_traj[-2*24,0,-1,closest_lon_index-2:closest_lon_index+2, closest_lat_index-2:closest_lat_index+2])
+    #return jnp.mean(TARGET_TEMP - final_temp) ** 2 
+    return (alpha/jnp.mean(final_temp)) + lam * reg_term, final_temp
 
 @partial(jax.jit)
-def update_step(diff_state, opt_state, non_diff_components):
+def update_step(diff_state, opt_state, non_diff_components, initial_diff_state):
     """Single optimization step preserving non-diff components"""
     # Gradient calculation using your state structure
-    loss, grads = jax.value_and_grad(compute_loss)(diff_state, non_diff_components)
+    (loss, temp), grads = jax.value_and_grad(compute_loss,has_aux=True)(diff_state, non_diff_components, initial_diff_state)
     
     # Apply updates
     updates, opt_state = optimizer.update(grads, opt_state)
     diff_state = optax.apply_updates(diff_state, updates)
     
-    return diff_state, opt_state, loss
+    return diff_state, opt_state, loss, temp
 
 # Initialization using your exact state structure
 initial_diff_state, initial_non_diff = extract_non_diff(initial_state)
 optimizer = optax.adam(learning_rate=1e-5)
 opt_state = optimizer.init(initial_diff_state)
-
 # Training loop
 current_diff = initial_diff_state
 current_non_diff = initial_non_diff
 
-pbar = tqdm(range(35), desc="Optimizing")  # Create a tqdm instance
+times = np.arange(outer_steps)
+losses = []
+eps = config['loss_threshold']
+
+pbar = tqdm(range(45), desc="Optimizing")  # Create a tqdm instance
 for step in pbar:
-    current_diff, opt_state, loss = update_step(
+    current_diff, opt_state, loss, temp = update_step(
         current_diff,
         opt_state,
-        current_non_diff
+        current_non_diff,
+        initial_diff_state
     )
-    
+    losses.append(loss)
+    if loss < eps:
+        break
     # Maintain non-diff components across steps
     full_state = reconstruct_full_state(current_diff, current_non_diff)
     _, current_non_diff = extract_non_diff(full_state)
 
-    pbar.set_description(f"Loss: {loss:.4f}")  # Update description correctly
+    mean_temp = 1000/loss
+    pbar.set_description(f"Mean temp: {temp:.4f}")  # Update description correctly
+
+    if step%10==0:
+        optimized_state = reconstruct_full_state(current_diff, current_non_diff)
+        final_state, predictions = model.unroll(
+            optimized_state,
+            all_forcings,
+            steps=outer_steps,
+            #timedelta=timedelta,
+            start_with_input=True,
+            )
+
+        predictions_ds = model.data_to_xarray(predictions, times=times)
+        # Only save temps and geoptential
+        predictions_ds = predictions_ds[['temperature', 'geopotential']]
+        predictions_ds.to_netcdf(f"optimized_step{step}.nc")
+
+        del predictions_ds, optimized_state, final_state, predictions
 
 print("Training complete.")
 
-times = np.arange(outer_steps)
+# Save losses
+losses = np.array(losses)
+np.save(config['output']['losses_file'], losses)
+
+#Save trajectories
 optimized_state = reconstruct_full_state(current_diff, current_non_diff)
 final_state, predictions = model.unroll(
     optimized_state,
@@ -177,7 +215,9 @@ final_state, predictions = model.unroll(
     start_with_input=True,
 )
 predictions_ds = model.data_to_xarray(predictions, times=times)
-predictions_ds.to_netcdf("optimized.nc")
+predictions_ds = predictions_ds
+predictions_ds.to_netcdf(config['output']['final_optimized_state'])
+
 
 final_state, predictions = model.unroll(
     initial_state,
@@ -187,5 +227,6 @@ final_state, predictions = model.unroll(
     start_with_input=True,
 )
 predictions_ds = model.data_to_xarray(predictions, times=times)
-predictions_ds.to_netcdf("original.nc")
+predictions_ds = predictions_ds
+predictions_ds.to_netcdf(config['output']['initial_state_output'])
 print("Trajectories saved!")
