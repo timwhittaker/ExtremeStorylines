@@ -1,0 +1,22 @@
+# Optimizer settings
+optimizer:
+  name: "adam"
+  learning_rate: 1e-5
+  iteration_number: 100
+
+# Loss threshold for stopping optimization
+loss:
+  lambda: 1500
+  beta: 1000
+
+# Number of days of evolution
+evol_days: 9 
+
+# Location for Lytton
+lytton_lat: 50.231111
+lytton_lon: 121.581389
+
+init_cond: "path_to_initial_conditions"
+
+# output dir, run name is generated from params
+output_dir: "path_to_output"
