@@ -1,232 +1,279 @@
 import jax
 import jax.numpy as jnp
-from jax import lax, tree_util as jtu
-from functools import partial
-import gcsfs
-import jax
+from jax import lax, tree_util as jtu, grad, jit, checkpoint, value_and_grad, block_until_ready
+import optax
 import numpy as np
 import pickle
 import xarray
-from jax import grad, jit, checkpoint, value_and_grad, block_until_ready
-import jax.numpy as jnp
-import optax
+from functools import partial
+import gcsfs
 from tqdm import tqdm
 import sys
-
-from dinosaur import horizontal_interpolation
-from dinosaur import spherical_harmonic
-from dinosaur import xarray_utils
-import neuralgcm
-
-import matplotlib.pyplot as plt
 import os
 import yaml
+import matplotlib.pyplot as plt
+import argparse  
+
+from dinosaur import (horizontal_interpolation, 
+                     spherical_harmonic, 
+                     xarray_utils)
+import neuralgcm
+
 
 gcs = gcsfs.GCSFileSystem(token='anon')
 
-with open("config.yaml", "r") as file:
-    config = yaml.safe_load(file)
-
-model_name = 'v1/deterministic_2_8_deg.pkl'
-with gcs.open(f'gs://neuralgcm/models/{model_name}', 'rb') as f:
-    ckpt = pickle.load(f)
-model = neuralgcm.PressureLevelModel.from_checkpoint(ckpt)
-
-
-sliced_era5 = xarray.open_zarr("hw_init_21.zarr", chunks=None)
-era5_grid = spherical_harmonic.Grid(
-    latitude_nodes=sliced_era5.sizes['latitude'],
-    longitude_nodes=sliced_era5.sizes['longitude'],
-    latitude_spacing=xarray_utils.infer_latitude_spacing(sliced_era5.latitude),
-    longitude_offset=xarray_utils.infer_longitude_offset(sliced_era5.longitude),
-)
-
-regridder = horizontal_interpolation.ConservativeRegridder(
-    era5_grid, model.data_coords.horizontal, skipna=True
-)
-eval_era5 = xarray_utils.regrid(sliced_era5, regridder)
-eval_era5 = xarray_utils.fill_nan_with_nearest(eval_era5)
-
-inner_steps = 24  # save model outputs once every 24 hours
-outer_steps = 1 * 24 // inner_steps  # total of 4 days
-timedelta = np.timedelta64(1, 'h') * inner_steps
-times = (np.arange(outer_steps) * inner_steps)  # time axis in hours
-
-# initialize model state
-inputs = model.inputs_from_xarray(eval_era5.isel(time=0))
-input_forcings = model.forcings_from_xarray(eval_era5.isel(time=0))
-rng_key = jax.random.key(42)  # optional for deterministic models
-initial_state = model.encode(inputs, input_forcings, rng_key)
-
-# use persistence for forcing variables (SST and sea ice cover)
-all_forcings = model.forcings_from_xarray(eval_era5.head(time=1))
-
-# Extract and reconstruct differentiable parts of the state
-def extract_non_diff(state):
-    """Extract non-differentiable components (prng_key, prng_step, etc.)"""
-    randomness = state.randomness
-    inner_state = state.state
-    memory = state.memory
-    divergence = inner_state.divergence
-    vorticity = inner_state.vorticity
-    temperature_variation = inner_state.temperature_variation
-    tracers = inner_state.tracers
-    sim_time = inner_state.sim_time
-    new_inner_state = inner_state.replace(temperature_variation=None, divergence=None, vorticity=None, tracers=None, sim_time=None)
-    #new_inner_state = inner_state.replace(temperature_variation=None, divergence=None, tracers=None, sim_time=None)
-    # Remove non-differentiable components
-    new_state = state.replace(state=new_inner_state, randomness=None, memory=None)
-
-    return new_state, (randomness, temperature_variation, divergence, vorticity, tracers, sim_time, memory)
-    #return new_state, (randomness, temperature_variation, divergence, tracers, sim_time, memory)
-
-
-def reconstruct_full_state(state_without_non_diff, non_diff_components):
-    """Reconstruct the full state by adding back non-differentiable components."""
-    randomness, temp_var, div, vort, tracers, sim_time, memory = non_diff_components
-    #randomness, temp_var, div, tracers, sim_time, memory = non_diff_components
-    temp_var = jax.lax.stop_gradient(temp_var)
-    div = jax.lax.stop_gradient(div)
-    vort = jax.lax.stop_gradient(vort)
-    tracers = jax.lax.stop_gradient(tracers)
-    sim_time = jax.lax.stop_gradient(sim_time)
-    inner_state = state_without_non_diff.state
-    new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, vorticity=vort, tracers=tracers, sim_time=sim_time)
-    #new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, tracers=tracers, sim_time=sim_time)
-    return state_without_non_diff.replace(randomness=randomness, state=new_inner_state, memory=memory)
-
-lytton_lat = 50.231111
-lytton_lon = 121.581389
-# Convert Lytton longitude to 0-360 range
-lytton_lon_positive = (360 - lytton_lon) % 360
-# Find the closest latitude
-closest_lat_index = np.abs(eval_era5.latitude.values - lytton_lat).argmin() + 1
-# Find the closest longitude
-closest_lon_index = np.abs(eval_era5.longitude.values - lytton_lon_positive).argmin() + 1
-print(closest_lat_index, closest_lon_index)
-# Configuration
-TARGET_TEMP = 320.0
-outer_steps = 9*24  # Total trajectory steps per iteration
-
-
-
-@partial(jax.jit)
-def compute_loss(diff_state, non_diff_components, initial_diff_state):
-    """Checkpoint-friendly loss computation using your state structure"""
-    # Reconstruct full state using your method
-    full_state = reconstruct_full_state(diff_state, non_diff_components)
+def create_output_directory(config):
+    """Create parameterized output directory structure"""
+    base_dir = config['output_dir']
     
-    # Memory-optimized unroll with checkpointing
-    def scan_fn(carry, _):
-        state = carry
-        new_state, preds = model.unroll(
-            state, all_forcings, steps=1, start_with_input=True
+    # Extract parameters
+    opt = config['optimizer']
+    loss = config['loss']
+    evol_days = config['evol_days']
+    lat = config['lytton_lat']
+    lon = config['lytton_lon']
+    init_cond = config['init_cond'].split('_')[-1].split('.')[0]
+
+    # Format directory components
+    components = [
+        f"lr{float(opt['learning_rate']):.0e}",
+        f"it{opt['iteration_number']}",
+        f"lam{loss['lambda']}",
+        f"b{loss['beta']}",
+        f"d{evol_days}",
+        f"init{init_cond}"
+    ]
+
+    # Clean special characters
+    clean_components = [c.replace('.', 'p').replace('-', 'm') for c in components]
+    
+    # Create full path
+    dir_name = "_".join(clean_components)
+    full_path = os.path.join(base_dir, dir_name)
+    
+    # Create directory and return path
+    os.makedirs(full_path, exist_ok=True)
+    return full_path
+
+def main(config_path):
+
+    # Load config
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+        
+    # Load model
+    model_name = 'v1/deterministic_2_8_deg.pkl'
+    with gcs.open(f'gs://neuralgcm/models/{model_name}', 'rb') as f:
+        ckpt = pickle.load(f)
+    model = neuralgcm.PressureLevelModel.from_checkpoint(ckpt)
+    
+    output_dir = create_output_directory(config)
+
+    # Load initial data
+    sliced_era5 = xarray.open_zarr(config['init_cond'], chunks=None)
+    era5_grid = spherical_harmonic.Grid(
+        latitude_nodes=sliced_era5.sizes['latitude'],
+        longitude_nodes=sliced_era5.sizes['longitude'],
+        latitude_spacing=xarray_utils.infer_latitude_spacing(sliced_era5.latitude),
+        longitude_offset=xarray_utils.infer_longitude_offset(sliced_era5.longitude),
+    )
+
+    regridder = horizontal_interpolation.ConservativeRegridder(
+        era5_grid, model.data_coords.horizontal, skipna=True
+    )
+    eval_era5 = xarray_utils.regrid(sliced_era5, regridder)
+    eval_era5 = xarray_utils.fill_nan_with_nearest(eval_era5)
+
+    # initialize model state
+    inputs = model.inputs_from_xarray(eval_era5.isel(time=0))
+    input_forcings = model.forcings_from_xarray(eval_era5.isel(time=0))
+    rng_key = jax.random.key(42)  
+    initial_state = model.encode(inputs, input_forcings, rng_key)
+
+    nodal_pressure = model.model_coords.horizontal.to_nodal(initial_state.state.log_surface_pressure)
+    nodal_pressure = model.from_nondim_units(nodal_pressure, 'kg/m/s**2')
+
+    # use persistence for forcing variables (SST and sea ice cover)
+    all_forcings = model.forcings_from_xarray(eval_era5.head(time=1))
+
+
+    # Extract and reconstruct differentiable parts of the state
+    def extract_non_diff(state):
+        """Simplified state extraction without commented alternatives"""
+        randomness = state.randomness
+        inner_state = state.state
+        components = (
+            randomness,
+            inner_state.temperature_variation,
+            inner_state.divergence,
+            inner_state.vorticity,
+            inner_state.tracers,
+            inner_state.sim_time,
+            state.memory
         )
-        return new_state, preds['temperature']
-    
-    # Checkpointed trajectory computation
-    _, temp_traj = lax.scan(
-        jax.checkpoint(scan_fn),
-        full_state,
-        None,
-        length=outer_steps
-    )
-    
-    # loss calculation
-    alpha = 1000
-    lam = 10
-    reg_term = jnp.sum((diff_state.state.log_surface_pressure - initial_diff_state.state.log_surface_pressure) ** 2)
-    final_temp = jnp.mean(temp_traj[-2*24,0,-1,closest_lon_index-2:closest_lon_index+2, closest_lat_index-2:closest_lat_index+2])
-    #return jnp.mean(TARGET_TEMP - final_temp) ** 2 
-    return (alpha/jnp.mean(final_temp)) + lam * reg_term, final_temp
+        new_inner_state = inner_state.replace(
+            temperature_variation=None,
+            divergence=None,
+            vorticity=None,
+            tracers=None,
+            sim_time=None
+        )
+        return state.replace(state=new_inner_state, randomness=None, memory=None), components
 
-@partial(jax.jit)
-def update_step(diff_state, opt_state, non_diff_components, initial_diff_state):
-    """Single optimization step preserving non-diff components"""
-    # Gradient calculation using your state structure
-    (loss, temp), grads = jax.value_and_grad(compute_loss,has_aux=True)(diff_state, non_diff_components, initial_diff_state)
-    
-    # Apply updates
-    updates, opt_state = optimizer.update(grads, opt_state)
-    diff_state = optax.apply_updates(diff_state, updates)
-    
-    return diff_state, opt_state, loss, temp
 
-# Initialization using your exact state structure
-initial_diff_state, initial_non_diff = extract_non_diff(initial_state)
-optimizer = optax.adam(learning_rate=1e-5)
-opt_state = optimizer.init(initial_diff_state)
-# Training loop
-current_diff = initial_diff_state
-current_non_diff = initial_non_diff
+    def reconstruct_full_state(state_without_non_diff, non_diff_components):
+        """Reconstruct the full state by adding back non-differentiable components."""
+        randomness, temp_var, div, vort, tracers, sim_time, memory = non_diff_components
+        temp_var = jax.lax.stop_gradient(temp_var)
+        div = jax.lax.stop_gradient(div)
+        vort = jax.lax.stop_gradient(vort)
+        tracers = jax.lax.stop_gradient(tracers)
+        sim_time = jax.lax.stop_gradient(sim_time)
+        inner_state = state_without_non_diff.state
+        new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, vorticity=vort, tracers=tracers, sim_time=sim_time)
+        return state_without_non_diff.replace(randomness=randomness, state=new_inner_state, memory=memory)
 
-times = np.arange(outer_steps)
-losses = []
-eps = config['loss_threshold']
+    lytton_lat = float(config['lytton_lat'])
+    lytton_lon = float(config['lytton_lon'])
+    lytton_lon_positive = (360 - lytton_lon) % 360
 
-pbar = tqdm(range(45), desc="Optimizing")  # Create a tqdm instance
-for step in pbar:
-    current_diff, opt_state, loss, temp = update_step(
-        current_diff,
-        opt_state,
-        current_non_diff,
-        initial_diff_state
-    )
-    losses.append(loss)
-    if loss < eps:
-        break
-    # Maintain non-diff components across steps
-    full_state = reconstruct_full_state(current_diff, current_non_diff)
-    _, current_non_diff = extract_non_diff(full_state)
+    def find_closest_index(coords, target):
+        return np.abs(coords - target).argmin()
 
-    mean_temp = 1000/loss
-    pbar.set_description(f"Mean temp: {temp:.4f}")  # Update description correctly
+    closest_lat_index = find_closest_index(eval_era5.latitude.values, lytton_lat)
+    closest_lon_index = find_closest_index(eval_era5.longitude.values, lytton_lon_positive)
 
-    if step%10==0:
-        optimized_state = reconstruct_full_state(current_diff, current_non_diff)
-        final_state, predictions = model.unroll(
-            optimized_state,
-            all_forcings,
-            steps=outer_steps,
-            #timedelta=timedelta,
-            start_with_input=True,
+    outer_steps = float(config['evol_days'])*24  # Total trajectory steps per iteration
+
+    @partial(jax.jit)
+    def compute_loss(diff_state, non_diff_components, initial_diff_state):
+        """Checkpoint-friendly loss computation using your state structure"""
+        # Reconstruct full state using your method
+        full_state = reconstruct_full_state(diff_state, non_diff_components)
+        
+        # Memory-optimized unroll with checkpointing
+        def scan_fn(carry, _):
+            state = carry
+            new_state, preds = model.unroll(
+                state, all_forcings, steps=1, start_with_input=True
             )
+            return new_state, preds['temperature']
+        
+        # Checkpointed trajectory computation
+        _, temp_traj = lax.scan(
+            jax.checkpoint(scan_fn),
+            full_state,
+            None,
+            length=outer_steps
+        )
+        
+        # loss calculation
+        beta = float(config['loss']['beta'])
+        lam = float(config['loss']['lambda'])
+        reg_term = jnp.sum((diff_state.state.log_surface_pressure - initial_diff_state.state.log_surface_pressure) ** 2)
+        final_temp = jnp.mean(temp_traj[-3*24,0,-1,closest_lon_index-2:closest_lon_index+2, closest_lat_index-2:closest_lat_index+2])
+        return (beta/jnp.mean(final_temp)) + lam * reg_term, final_temp
+        #return (320-jnp.mean(final_temp))**2, final_temp
+        #return jnp.exp(jnp.mean(final_temp)/10000), final_temp
 
-        predictions_ds = model.data_to_xarray(predictions, times=times)
-        # Only save temps and geoptential
-        predictions_ds = predictions_ds[['temperature', 'geopotential']]
-        predictions_ds.to_netcdf(f"optimized_step{step}.nc")
+    @partial(jax.jit)
+    def update_step(diff_state, opt_state, non_diff_components, initial_diff_state):
+        """Single optimization step preserving non-diff components"""
+        (loss, temp), grads = jax.value_and_grad(compute_loss,has_aux=True)(diff_state, non_diff_components, initial_diff_state)
+        
+        # Apply updates
+        updates, opt_state = optimizer.update(grads, opt_state)
+        diff_state = optax.apply_updates(diff_state, updates)
+        
+        return diff_state, opt_state, loss, temp
 
-        del predictions_ds, optimized_state, final_state, predictions
+    # Initialization
+    initial_diff_state, initial_non_diff = extract_non_diff(initial_state)
+    optimizer = optax.adam(learning_rate=float(config['optimizer']['learning_rate']))
+    opt_state = optimizer.init(initial_diff_state)
+    # Training loop
+    current_diff = initial_diff_state
+    current_non_diff = initial_non_diff
 
-print("Training complete.")
+    times = np.arange(outer_steps)
+    losses = []
+    eps = config['loss']['loss_threshold']
 
-# Save losses
-losses = np.array(losses)
-np.save(config['output']['losses_file'], losses)
+    pbar = tqdm(range(config['optimizer']['iteration_number']), desc="Optimizing")  
+    for step in pbar:
+        current_diff, opt_state, loss, temp = update_step(
+            current_diff,
+            opt_state,
+            current_non_diff,
+            initial_diff_state
+        )
+        losses.append(loss)
+        if loss < eps:
+            break
+        # Maintain non-diff components across steps
+        full_state = reconstruct_full_state(current_diff, current_non_diff)
+        _, current_non_diff = extract_non_diff(full_state)
 
-#Save trajectories
-optimized_state = reconstruct_full_state(current_diff, current_non_diff)
-final_state, predictions = model.unroll(
-    optimized_state,
-    all_forcings,
-    steps=outer_steps,
-    #timedelta=timedelta,
-    start_with_input=True,
-)
-predictions_ds = model.data_to_xarray(predictions, times=times)
-predictions_ds = predictions_ds
-predictions_ds.to_netcdf(config['output']['final_optimized_state'])
+        pbar.set_description(f"Loss: {loss:.4f}, Mean temp: {temp:.4f}")  
 
+        if step%10==0: # make this a config param
+            optimized_state = reconstruct_full_state(current_diff, current_non_diff)
+            final_state, predictions = model.unroll(
+                optimized_state,
+                all_forcings,
+                steps=outer_steps,
+                start_with_input=True,
+                )
 
-final_state, predictions = model.unroll(
-    initial_state,
-    all_forcings,
-    steps=outer_steps,
-    #timedelta=timedelta,
-    start_with_input=True,
-)
-predictions_ds = model.data_to_xarray(predictions, times=times)
-predictions_ds = predictions_ds
-predictions_ds.to_netcdf(config['output']['initial_state_output'])
-print("Trajectories saved!")
+            predictions_ds = model.data_to_xarray(predictions, times=times)
+            # Only save temps and geoptential
+            predictions_ds = predictions_ds[['temperature', 'geopotential']]
+            predictions_ds.to_netcdf(f"{output_dir}/optimized_step{step}.nc")
+            # save the log pressure
+            sp = model.from_nondim_units(jnp.squeeze(jnp.exp(optimized_state.state.log_surface_pressure), axis=0), 'kg / (meter s**2)')
+            np.save(f"{output_dir}/log_surface_pressure_{step}",sp)
+
+            del predictions_ds, optimized_state, final_state, predictions
+
+    print("Training complete.")
+
+    # Save losses
+    losses = np.array(losses)
+    np.save(f"{output_dir}/losses", losses)
+
+    #Save trajectories
+    optimized_state = reconstruct_full_state(current_diff, current_non_diff)
+    final_state, predictions = model.unroll(
+        optimized_state,
+        all_forcings,
+        steps=outer_steps,
+        start_with_input=True,
+    )
+    predictions_ds = model.data_to_xarray(predictions, times=times)
+    predictions_ds = predictions_ds
+    predictions_ds.to_netcdf(f"{output_dir}/optimized.nc")
+    nodal_pressure = model.model_coords.horizontal.to_nodal(optimized_state.state.log_surface_pressure)
+    sp = model.from_nondim_units(jnp.squeeze(jnp.exp(nodal_pressure), axis=0), 'kg / (meter s**2)')
+    np.save(f"{output_dir}/log_surface_pressure_opt",sp)
+
+    final_state, predictions = model.unroll(
+        initial_state,
+        all_forcings,
+        steps=outer_steps,
+        start_with_input=True,
+    )
+    predictions_ds = model.data_to_xarray(predictions, times=times)
+    predictions_ds = predictions_ds
+    predictions_ds.to_netcdf(f"{output_dir}/original.nc")
+    nodal_pressure = model.model_coords.horizontal.to_nodal(initial_state.state.log_surface_pressure)
+    sp = model.from_nondim_units(jnp.squeeze(jnp.exp(nodal_pressure), axis=0), 'kg / (meter s**2)')
+    np.save(f"{output_dir}/log_surface_pressure_original",sp)
+    print("Trajectories saved!")
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to configuration YAML file")
+    args = parser.parse_args()
+    
+    main(args.config)
