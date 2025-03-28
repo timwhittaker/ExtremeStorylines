@@ -65,6 +65,38 @@ def main(config_path):
     model_name = 'v1/deterministic_2_8_deg.pkl'
     with gcs.open(f'gs://neuralgcm/models/{model_name}', 'rb') as f:
         ckpt = pickle.load(f)
+    # Add surface pressure
+    new_inputs_to_units_mapping = {
+        'u': 'meter / second',
+        'v': 'meter / second',
+        't': 'kelvin',
+        'z': 'm**2 s**-2',
+        'sim_time': 'dimensionless',
+        'tracers': {
+            'specific_humidity': 'dimensionless',
+            'specific_cloud_liquid_water_content': 'dimensionless',
+            'specific_cloud_ice_water_content': 'dimensionless',
+        },
+        'diagnostics': {'surface_pressure': 'kg / (meter s**2)'},
+    }
+
+    new_model_config_str = '\n'.join([
+        ckpt['model_config_str'],
+        (
+            'DimensionalLearnedPrimitiveToWeatherbenchDecoder.inputs_to_units_mapping'
+            f' = {new_inputs_to_units_mapping}'
+        ),
+        (
+            'DimensionalLearnedPrimitiveToWeatherbenchDecoder.diagnostics_module ='
+            ' @NodalModelDiagnosticsDecoder'
+        ),
+        (
+            'StochasticPhysicsParameterizationStep.diagnostics_module ='
+            ' @SurfacePressureDiagnostics'
+        ),
+    ])
+    ckpt['model_config_str'] = new_model_config_str
+
     model = neuralgcm.PressureLevelModel.from_checkpoint(ckpt)
     
     output_dir = create_output_directory(config)
