@@ -62,10 +62,10 @@ def main(config_path):
         config = yaml.safe_load(f)
         
     # Load model
-    model_name = 'v1/deterministic_2_8_deg.pkl'
+    model_name = 'v1_precip/stochastic_precip_2_8_deg.pkl'#'v1/deterministic_2_8_deg.pkl'
     with gcs.open(f'gs://neuralgcm/models/{model_name}', 'rb') as f:
         ckpt = pickle.load(f)
-    # Add surface pressure
+        
     new_inputs_to_units_mapping = {
         'u': 'meter / second',
         'v': 'meter / second',
@@ -122,32 +122,20 @@ def main(config_path):
     rng_key = jax.random.key(42)  
     initial_state = model.encode(inputs, input_forcings, rng_key)
 
-    nodal_pressure = model.model_coords.horizontal.to_nodal(initial_state.state.log_surface_pressure)
-    nodal_pressure = model.from_nondim_units(nodal_pressure, 'kg/m/s**2')
-
     # use persistence for forcing variables (SST and sea ice cover)
     all_forcings = model.forcings_from_xarray(eval_era5.head(time=1))
 
 
     # Extract and reconstruct differentiable parts of the state
     def extract_non_diff(state):
-        """Simplified state extraction without commented alternatives"""
         randomness = state.randomness
         inner_state = state.state
         components = (
             randomness,
-            inner_state.temperature_variation,
-            inner_state.divergence,
-            inner_state.vorticity,
-            inner_state.tracers,
             inner_state.sim_time,
             state.memory
         )
         new_inner_state = inner_state.replace(
-            temperature_variation=None,
-            divergence=None,
-            vorticity=None,
-            tracers=None,
             sim_time=None
         )
         return state.replace(state=new_inner_state, randomness=None, memory=None), components
@@ -155,14 +143,10 @@ def main(config_path):
 
     def reconstruct_full_state(state_without_non_diff, non_diff_components):
         """Reconstruct the full state by adding back non-differentiable components."""
-        randomness, temp_var, div, vort, tracers, sim_time, memory = non_diff_components
-        temp_var = jax.lax.stop_gradient(temp_var)
-        div = jax.lax.stop_gradient(div)
-        vort = jax.lax.stop_gradient(vort)
-        tracers = jax.lax.stop_gradient(tracers)
+        randomness, sim_time, memory = non_diff_components
         sim_time = jax.lax.stop_gradient(sim_time)
         inner_state = state_without_non_diff.state
-        new_inner_state = inner_state.replace(temperature_variation=temp_var, divergence=div, vorticity=vort, tracers=tracers, sim_time=sim_time)
+        new_inner_state = inner_state.replace(sim_time=sim_time)
         return state_without_non_diff.replace(randomness=randomness, state=new_inner_state, memory=memory)
 
     lytton_lat = float(config['lytton_lat'])
@@ -201,12 +185,32 @@ def main(config_path):
         
         # loss calculation
         beta = float(config['loss']['beta'])
-        lam = float(config['loss']['lambda'])
-        reg_term = jnp.sum((diff_state.state.log_surface_pressure - initial_diff_state.state.log_surface_pressure) ** 2)
-        final_temp = jnp.mean(temp_traj[-3*24,0,-1,closest_lon_index-2:closest_lon_index+2, closest_lat_index-2:closest_lat_index+2])
-        return (beta/jnp.mean(final_temp)) + lam * reg_term, final_temp
-        #return (320-jnp.mean(final_temp))**2, final_temp
-        #return jnp.exp(jnp.mean(final_temp)/10000), final_temp
+        lam0 = float(config['loss']['lambda'])
+
+
+        T_ref = 298.15 
+        p_ref = jnp.mean(initial_diff_state.state.log_surface_pressure)**2
+        v_ref = jnp.mean(initial_diff_state.state.vorticity)**2
+        d_ref = jnp.mean(initial_diff_state.state.divergence)**2
+        T0_ref = jnp.mean(initial_diff_state.state.temperature_variation)**2
+        sh_ref = jnp.mean(initial_diff_state.state.tracers['specific_humidity'])**2
+        sciwc_ref = jnp.mean(initial_diff_state.state.tracers['specific_cloud_ice_water_content'])**2
+        sclwc_ref = jnp.mean(initial_diff_state.state.tracers['specific_cloud_liquid_water_content'])**2
+
+        # Make these parameters in config !!
+        reg_term_p = jnp.mean((diff_state.state.log_surface_pressure - initial_diff_state.state.log_surface_pressure) ** 2)
+        reg_term_d = 1000*jnp.mean((diff_state.state.divergence - initial_diff_state.state.divergence) ** 2)
+        reg_term_v = 1000*jnp.mean((diff_state.state.vorticity - initial_diff_state.state.vorticity) ** 2)
+        reg_term_T = 100*jnp.mean((diff_state.state.temperature_variation - initial_diff_state.state.temperature_variation) ** 2)
+        reg_term_sh = 100*jnp.mean((diff_state.state.tracers['specific_humidity'] - initial_diff_state.state.tracers['specific_humidity']) ** 2)
+        reg_term_sciwc = jnp.mean((diff_state.state.tracers['specific_cloud_ice_water_content'] - initial_diff_state.state.tracers['specific_cloud_ice_water_content']) ** 2)
+        reg_term_sclwc = jnp.mean((diff_state.state.tracers['specific_cloud_ice_water_content'] - initial_diff_state.state.tracers['specific_cloud_ice_water_content']) ** 2)
+        
+        final_temp = jnp.mean(temp_traj[-5*24:,0,-1,closest_lon_index-2:closest_lon_index+2, closest_lat_index-2:closest_lat_index+2])
+        
+        lam = lam0 
+        
+        return ((beta*T_ref)/jnp.sqrt(jnp.mean(final_temp)))+ (lam) * (reg_term_p/p_ref+reg_term_d/d_ref+reg_term_v/v_ref+reg_term_T/T0_ref + reg_term_sh/sh_ref + reg_term_sciwc/sciwc_ref + reg_term_sclwc/sclwc_ref), final_temp #, reg_term_perc
 
     @partial(jax.jit)
     def update_step(diff_state, opt_state, non_diff_components, initial_diff_state):
@@ -248,7 +252,7 @@ def main(config_path):
 
         pbar.set_description(f"Loss: {loss:.4f}, Mean temp: {temp:.4f}")  
 
-        if step%10==0: # make this a config param
+        if step%100==0: # make this a config param
             optimized_state = reconstruct_full_state(current_diff, current_non_diff)
             final_state, predictions = model.unroll(
                 optimized_state,
@@ -279,27 +283,39 @@ def main(config_path):
         optimized_state,
         all_forcings,
         steps=outer_steps,
-        start_with_input=True,
+        #start_with_input=True,
     )
     predictions_ds = model.data_to_xarray(predictions, times=times)
     predictions_ds = predictions_ds
     predictions_ds.to_netcdf(f"{output_dir}/optimized.nc")
     nodal_pressure = model.model_coords.horizontal.to_nodal(optimized_state.state.log_surface_pressure)
+    nodal_vort = model.model_coords.horizontal.to_nodal(optimized_state.state.vorticity)
+    nodal_div = model.model_coords.horizontal.to_nodal(optimized_state.state.divergence)
+    vort = model.from_nondim_units(nodal_vort, '1/s')
+    div = model.from_nondim_units(nodal_div, '1/s')
     sp = model.from_nondim_units(jnp.squeeze(jnp.exp(nodal_pressure), axis=0), 'kg / (meter s**2)')
     np.save(f"{output_dir}/log_surface_pressure_opt",sp)
+    np.save(f"{output_dir}/vorticity_opt",vort)
+    np.save(f"{output_dir}/divergence_opt",div)
 
     final_state, predictions = model.unroll(
         initial_state,
         all_forcings,
         steps=outer_steps,
-        start_with_input=True,
+        #start_with_input=True,
     )
     predictions_ds = model.data_to_xarray(predictions, times=times)
     predictions_ds = predictions_ds
     predictions_ds.to_netcdf(f"{output_dir}/original.nc")
     nodal_pressure = model.model_coords.horizontal.to_nodal(initial_state.state.log_surface_pressure)
+    nodal_vort = model.model_coords.horizontal.to_nodal(initial_state.state.vorticity)
+    nodal_div = model.model_coords.horizontal.to_nodal(initial_state.state.divergence)
+    vort = model.from_nondim_units(nodal_vort, '1/s')
+    div = model.from_nondim_units(nodal_div, '1/s')
     sp = model.from_nondim_units(jnp.squeeze(jnp.exp(nodal_pressure), axis=0), 'kg / (meter s**2)')
     np.save(f"{output_dir}/log_surface_pressure_original",sp)
+    np.save(f"{output_dir}/vorticity_original",vort)
+    np.save(f"{output_dir}/divergence_original",div)
     print("Trajectories saved!")
     
 if __name__ == "__main__":
