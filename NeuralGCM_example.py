@@ -65,7 +65,8 @@ def main(config_path):
     model_name = 'v1_precip/stochastic_precip_2_8_deg.pkl'#'v1/deterministic_2_8_deg.pkl'
     with gcs.open(f'gs://neuralgcm/models/{model_name}', 'rb') as f:
         ckpt = pickle.load(f)
-        
+    
+    # Make sure we output surface pressure
     new_inputs_to_units_mapping = {
         'u': 'meter / second',
         'v': 'meter / second',
@@ -119,12 +120,11 @@ def main(config_path):
     # initialize model state
     inputs = model.inputs_from_xarray(eval_era5.isel(time=0))
     input_forcings = model.forcings_from_xarray(eval_era5.isel(time=0))
-    rng_key = jax.random.key(42)  
+    rng_key = jax.random.key(42)  #
     initial_state = model.encode(inputs, input_forcings, rng_key)
 
     # use persistence for forcing variables (SST and sea ice cover)
     all_forcings = model.forcings_from_xarray(eval_era5.head(time=1))
-
 
     # Extract and reconstruct differentiable parts of the state
     def extract_non_diff(state):
@@ -149,6 +149,7 @@ def main(config_path):
         new_inner_state = inner_state.replace(sim_time=sim_time)
         return state_without_non_diff.replace(randomness=randomness, state=new_inner_state, memory=memory)
 
+    # Target domain
     lytton_lat = float(config['lytton_lat'])
     lytton_lon = float(config['lytton_lon'])
     lytton_lon_positive = (360 - lytton_lon) % 360
@@ -163,7 +164,7 @@ def main(config_path):
 
     @partial(jax.jit)
     def compute_loss(diff_state, non_diff_components, initial_diff_state):
-        """Checkpoint-friendly loss computation using your state structure"""
+        """Checkpoint loss computation using your state structure"""
         # Reconstruct full state using your method
         full_state = reconstruct_full_state(diff_state, non_diff_components)
         
@@ -197,20 +198,21 @@ def main(config_path):
         sciwc_ref = jnp.mean(initial_diff_state.state.tracers['specific_cloud_ice_water_content'])**2
         sclwc_ref = jnp.mean(initial_diff_state.state.tracers['specific_cloud_liquid_water_content'])**2
 
-        # Make these parameters in config !!
+        # TODO: Make these parameters in config !!
         reg_term_p = jnp.mean((diff_state.state.log_surface_pressure - initial_diff_state.state.log_surface_pressure) ** 2)
-        reg_term_d = 1000*jnp.mean((diff_state.state.divergence - initial_diff_state.state.divergence) ** 2)
-        reg_term_v = 1000*jnp.mean((diff_state.state.vorticity - initial_diff_state.state.vorticity) ** 2)
+        reg_term_d = 100*jnp.mean((diff_state.state.divergence - initial_diff_state.state.divergence) ** 2)
+        reg_term_v = 100*jnp.mean((diff_state.state.vorticity - initial_diff_state.state.vorticity) ** 2)
         reg_term_T = 100*jnp.mean((diff_state.state.temperature_variation - initial_diff_state.state.temperature_variation) ** 2)
-        reg_term_sh = 100*jnp.mean((diff_state.state.tracers['specific_humidity'] - initial_diff_state.state.tracers['specific_humidity']) ** 2)
+        reg_term_sh = 10*jnp.mean((diff_state.state.tracers['specific_humidity'] - initial_diff_state.state.tracers['specific_humidity']) ** 2)
         reg_term_sciwc = jnp.mean((diff_state.state.tracers['specific_cloud_ice_water_content'] - initial_diff_state.state.tracers['specific_cloud_ice_water_content']) ** 2)
         reg_term_sclwc = jnp.mean((diff_state.state.tracers['specific_cloud_ice_water_content'] - initial_diff_state.state.tracers['specific_cloud_ice_water_content']) ** 2)
         
+        # TODO: Should add number of days to opt as a param in config!!
         final_temp = jnp.mean(temp_traj[-5*24:,0,-1,closest_lon_index-2:closest_lon_index+2, closest_lat_index-2:closest_lat_index+2])
         
         lam = lam0 
         
-        return ((beta*T_ref)/jnp.sqrt(jnp.mean(final_temp)))+ (lam) * (reg_term_p/p_ref+reg_term_d/d_ref+reg_term_v/v_ref+reg_term_T/T0_ref + reg_term_sh/sh_ref + reg_term_sciwc/sciwc_ref + reg_term_sclwc/sclwc_ref), final_temp #, reg_term_perc
+        return ((beta*T_ref)/jnp.sqrt(jnp.mean(final_temp)))+ (lam) * (reg_term_p/p_ref+reg_term_d/d_ref+reg_term_v/v_ref+reg_term_T/T0_ref + reg_term_sh/sh_ref + reg_term_sciwc/sciwc_ref + reg_term_sclwc/sclwc_ref), final_temp 
 
     @partial(jax.jit)
     def update_step(diff_state, opt_state, non_diff_components, initial_diff_state):
@@ -233,7 +235,6 @@ def main(config_path):
 
     times = np.arange(outer_steps)
     losses = []
-    eps = config['loss']['loss_threshold']
 
     pbar = tqdm(range(config['optimizer']['iteration_number']), desc="Optimizing")  
     for step in pbar:
@@ -244,15 +245,14 @@ def main(config_path):
             initial_diff_state
         )
         losses.append(loss)
-        if loss < eps:
-            break
         # Maintain non-diff components across steps
         full_state = reconstruct_full_state(current_diff, current_non_diff)
         _, current_non_diff = extract_non_diff(full_state)
 
         pbar.set_description(f"Loss: {loss:.4f}, Mean temp: {temp:.4f}")  
 
-        if step%100==0: # make this a config param
+        # Save intermediate trajectories
+        if step%100==0: # TODO: make this a config param
             optimized_state = reconstruct_full_state(current_diff, current_non_diff)
             final_state, predictions = model.unroll(
                 optimized_state,
