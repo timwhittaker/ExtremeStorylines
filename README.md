@@ -34,4 +34,6 @@ lytton_lat: 50.231111 # target coord
 lytton_lon: 121.581389 # target coord
 init_cond: "path_to_initial_conditions" # path to i.c. zarr file
 output_dir: "path_to_output" # path to output folder
+```
 
+Initial conditions we use can be found [here](https://uqam-my.sharepoint.com/:u:/r/personal/cf891976_ens_uqam_ca/Documents/ExtremeStoryline/initial_cond.zip?csf=1&web=1&e=cxiunK)
