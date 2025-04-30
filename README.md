@@ -22,8 +22,16 @@ Before running the script, ensure you have the following dependencies installed:
 ## Configuration
 Modify the `config.yaml` file to specify parameters such as:
 ```yaml
-loss_threshold: 1e-3
-output:
-  losses_file: "losses.npy"
-  final_optimized_state: "final_optimized.nc"
-  initial_state_output: ""
+optimizer:
+  name: "adam"
+  learning_rate: 1e-9 # learning rate
+  iteration_number: 50 # epochs
+loss:
+  lambda: 20 # overall weighing factor for the i.c. violation
+  beta: 10 # strength of target term
+evol_days: 11 # total number of evolution days
+lytton_lat: 50.231111 # target coord
+lytton_lon: 121.581389 # target coord
+init_cond: "path_to_initial_conditions" # path to i.c. zarr file
+output_dir: "path_to_output" # path to output folder
+
