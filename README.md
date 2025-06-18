@@ -1,6 +1,6 @@
 # ExtremeStorylines
 
-Sample code for the (...) paper. 
+Sample code for the https://arxiv.org/abs/2506.10660 paper. 
 
 ## Overview
 This project optimizes a initial conditions to achieve a target temperature at a specific location (Lytton, BC). The model is initialized with ERA5 climate data and uses gradient-based optimization with `optax` and JAX. Some other small examples are included such as Lorenz96 and the Dinosaur dynamical core.
