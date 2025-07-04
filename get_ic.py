@@ -61,8 +61,7 @@ full_era5 = xarray.open_zarr(gcs.get_mapper(era5_path), chunks=None)
 
 demo_start_time = '2021-06-18'
 demo_end_time = '2021-06-19'
-demo_start_time = '2021-06-18T23:00:00'
-demo_end_time = '2021-06-19T01:00:00'
+
 data_inner_steps = 1  # process every 24th hour
 
 sliced_era5 = (
