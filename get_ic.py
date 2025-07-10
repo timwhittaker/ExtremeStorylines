@@ -58,10 +58,8 @@ model = neuralgcm.PressureLevelModel.from_checkpoint(ckpt)
 # Access data on google storage
 era5_path = 'gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3'
 full_era5 = xarray.open_zarr(gcs.get_mapper(era5_path), chunks=None)
-
-demo_start_time = '2021-06-18'
-demo_end_time = '2021-06-19'
-
+demo_start_time = '2021-06-18T00:00:00'
+demo_end_time = '2021-06-18T01:00:00'
 data_inner_steps = 1  # process every 24th hour
 
 sliced_era5 = (
